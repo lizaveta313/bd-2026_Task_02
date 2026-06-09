@@ -1,138 +1,118 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import os
 import sys
-from typing import Dict, Iterable
 
 try:
-    import numpy as np
-    import pyarrow.parquet as pq
+    import polars as pl
 except ImportError:
-    np = None
-    pq = None
+    pl = None
 
 
-DEFAULT_BATCH_SIZE = 1_000_000
-REQUIRED_COLUMNS = ["price", "quantity", "timestamp", "is_buyer_maker"]
+EXPECTED_SCHEMA = {
+    "trade_id": pl.UInt64 if pl is not None else None,
+    "timestamp": pl.Datetime("ns") if pl is not None else None,
+    "price": pl.Float64 if pl is not None else None,
+    "quantity": pl.Float64 if pl is not None else None,
+    "quote_qty": pl.Float64 if pl is not None else None,
+    "is_buyer_maker": pl.Boolean if pl is not None else None,
+}
+REQUIRED_COLUMNS = ["timestamp", "price", "quantity", "is_buyer_maker"]
+NS_PER_SECOND = 1_000_000_000
+NS_PER_MINUTE = 60 * NS_PER_SECOND
 
 
-def parse_batch_size() -> int:
-    raw_value = os.environ.get("BATCH_SIZE")
-    if raw_value is None:
-        return DEFAULT_BATCH_SIZE
-    try:
-        value = int(raw_value)
-    except ValueError:
-        return DEFAULT_BATCH_SIZE
-    return value if value > 0 else DEFAULT_BATCH_SIZE
+def validate_schema(schema: pl.Schema) -> None:
+    for column_name, expected_type in EXPECTED_SCHEMA.items():
+        actual_type = schema.get(column_name)
+        if actual_type is None:
+            raise ValueError(f"missing required column: {column_name}")
+        if actual_type != expected_type:
+            raise ValueError(
+                f"column {column_name} has type {actual_type}, expected {expected_type}"
+            )
 
 
-def add_grouped_sums(
-    buckets: np.ndarray,
-    values_num: np.ndarray,
-    values_den: np.ndarray,
-    out_num: Dict[int, float],
-    out_den: Dict[int, float],
-) -> None:
-    if buckets.size == 0:
-        return
-
-    unique_buckets, inverse = np.unique(buckets, return_inverse=True)
-    grouped_num = np.bincount(inverse, weights=values_num)
-    grouped_den = np.bincount(inverse, weights=values_den)
-
-    for bucket, num, den in zip(unique_buckets, grouped_num, grouped_den):
-        key = int(bucket)
-        out_num[key] = out_num.get(key, 0.0) + float(num)
-        out_den[key] = out_den.get(key, 0.0) + float(den)
-
-
-def add_side_aggregates(
-    buckets: np.ndarray,
-    amount: np.ndarray,
-    quantity: np.ndarray,
-    side_mask: np.ndarray,
-    out_num: Dict[int, float],
-    out_den: Dict[int, float],
-) -> None:
-    # Zero-quantity rows cannot affect a valid VWAP and skipping them reduces work.
-    mask = side_mask & (quantity != 0.0)
-    add_grouped_sums(buckets[mask], amount[mask], quantity[mask], out_num, out_den)
-
-
-def sum_abs_vwap_diff(
-    buy_num: Dict[int, float],
-    buy_den: Dict[int, float],
-    sell_num: Dict[int, float],
-    sell_den: Dict[int, float],
-) -> float:
-    total = 0.0
-    compensation = 0.0
-
-    if len(buy_num) <= len(sell_num):
-        keys: Iterable[int] = buy_num.keys()
-        other = sell_num
-    else:
-        keys = sell_num.keys()
-        other = buy_num
-
-    for bucket in keys:
-        if bucket not in other:
-            continue
-
-        b_den = buy_den.get(bucket, 0.0)
-        s_den = sell_den.get(bucket, 0.0)
-        if b_den == 0.0 or s_den == 0.0:
-            continue
-
-        value = abs((buy_num[bucket] / b_den) - (sell_num[bucket] / s_den))
-
-        # Kahan summation keeps the final bucket total stable for long inputs.
-        corrected = value - compensation
-        new_total = total + corrected
-        compensation = (new_total - total) - corrected
-        total = new_total
-
-    return total
-
-
-def calculate(path: str, batch_size: int) -> tuple[float, float]:
-    if np is None or pq is None:
-        raise RuntimeError("required dependencies are not installed: numpy and pyarrow")
-
-    parquet_file = pq.ParquetFile(path)
-
-    sec_buy_num: Dict[int, float] = {}
-    sec_buy_den: Dict[int, float] = {}
-    sec_sell_num: Dict[int, float] = {}
-    sec_sell_den: Dict[int, float] = {}
-    min_buy_num: Dict[int, float] = {}
-    min_buy_den: Dict[int, float] = {}
-    min_sell_num: Dict[int, float] = {}
-    min_sell_den: Dict[int, float] = {}
-
-    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=REQUIRED_COLUMNS):
-        price = batch.column("price").to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
-        quantity = batch.column("quantity").to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
-        timestamp = batch.column("timestamp").to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-        is_buyer_maker = batch.column("is_buyer_maker").to_numpy(zero_copy_only=False).astype(
-            np.bool_, copy=False
+def sum_diff_plan(data: pl.LazyFrame, name: str) -> pl.LazyFrame:
+    return (
+        data.filter((pl.col("buy_den") != 0.0) & (pl.col("sell_den") != 0.0))
+        .select(
+            (
+                (pl.col("buy_num") / pl.col("buy_den"))
+                - (pl.col("sell_num") / pl.col("sell_den"))
+            )
+            .abs()
+            .sum()
+            .alias(name)
         )
+    )
 
-        amount = price * quantity
-        second_bucket = timestamp // 1000
-        minute_bucket = timestamp // 60000
 
-        buy_mask = ~is_buyer_maker
-        sell_mask = is_buyer_maker
+def build_plans(data: pl.LazyFrame) -> tuple[pl.LazyFrame, pl.LazyFrame]:
+    second_agg = (
+        data.select(REQUIRED_COLUMNS)
+        .filter(pl.col("quantity") != 0.0)
+        .with_columns(
+            timestamp_ns=pl.col("timestamp").cast(pl.Int64),
+            amount=pl.col("price") * pl.col("quantity"),
+        )
+        .with_columns(
+            second=pl.col("timestamp_ns") // NS_PER_SECOND,
+            minute=pl.col("timestamp_ns") // NS_PER_MINUTE,
+        )
+        .group_by("second", "minute")
+        .agg(
+            buy_num=pl.when(~pl.col("is_buyer_maker"))
+            .then(pl.col("amount"))
+            .otherwise(0.0)
+            .sum(),
+            buy_den=pl.when(~pl.col("is_buyer_maker"))
+            .then(pl.col("quantity"))
+            .otherwise(0.0)
+            .sum(),
+            sell_num=pl.when(pl.col("is_buyer_maker"))
+            .then(pl.col("amount"))
+            .otherwise(0.0)
+            .sum(),
+            sell_den=pl.when(pl.col("is_buyer_maker"))
+            .then(pl.col("quantity"))
+            .otherwise(0.0)
+            .sum(),
+        )
+    )
 
-        add_side_aggregates(second_bucket, amount, quantity, buy_mask, sec_buy_num, sec_buy_den)
-        add_side_aggregates(second_bucket, amount, quantity, sell_mask, sec_sell_num, sec_sell_den)
-        add_side_aggregates(minute_bucket, amount, quantity, buy_mask, min_buy_num, min_buy_den)
-        add_side_aggregates(minute_bucket, amount, quantity, sell_mask, min_sell_num, min_sell_den)
+    minute_agg = (
+        second_agg.group_by("minute")
+        .agg(
+            buy_num=pl.col("buy_num").sum(),
+            buy_den=pl.col("buy_den").sum(),
+            sell_num=pl.col("sell_num").sum(),
+            sell_den=pl.col("sell_den").sum(),
+        )
+    )
 
-    vwap_s = sum_abs_vwap_diff(sec_buy_num, sec_buy_den, sec_sell_num, sec_sell_den)
-    vwap_m = sum_abs_vwap_diff(min_buy_num, min_buy_den, min_sell_num, min_sell_den)
-    return vwap_s, vwap_m
+    return sum_diff_plan(second_agg, "VWAP_s"), sum_diff_plan(minute_agg, "VWAP_m")
+
+
+def frame_value(frame: pl.DataFrame) -> float:
+    value = frame.item()
+    return 0.0 if value is None else float(value)
+
+
+def calculate(path: str) -> tuple[float, float]:
+    if pl is None:
+        raise RuntimeError("required dependency is not installed: polars")
+
+    data = pl.scan_parquet(path)
+    validate_schema(data.collect_schema())
+
+    second_plan, minute_plan = build_plans(data)
+    second_result, minute_result = pl.collect_all(
+        [second_plan, minute_plan],
+        engine="streaming",
+    )
+    return frame_value(second_result), frame_value(minute_result)
 
 
 def main() -> int:
@@ -146,7 +126,7 @@ def main() -> int:
         return 1
 
     try:
-        vwap_s, vwap_m = calculate(path, parse_batch_size())
+        vwap_s, vwap_m = calculate(path)
     except Exception as exc:
         print(f"error: failed to read or process parquet file: {exc}", file=sys.stderr)
         return 1
