@@ -1,70 +1,49 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import math
 import os
 import sys
+from typing import Iterable
 
 try:
     import polars as pl
-except ImportError:
-    pl = None
+except ImportError:  # pragma: no cover - handled at runtime in main()
+    pl = None  # type: ignore[assignment]
 
 
-EXPECTED_SCHEMA = {
-    "trade_id": pl.UInt64 if pl is not None else None,
-    "timestamp": pl.Datetime("ns") if pl is not None else None,
-    "price": pl.Float64 if pl is not None else None,
-    "quantity": pl.Float64 if pl is not None else None,
-    "quote_qty": pl.Float64 if pl is not None else None,
-    "is_buyer_maker": pl.Boolean if pl is not None else None,
-}
-REQUIRED_COLUMNS = ["timestamp", "price", "quantity", "is_buyer_maker"]
 NS_PER_SECOND = 1_000_000_000
-NS_PER_MINUTE = 60 * NS_PER_SECOND
+REQUIRED_COLUMNS = ("timestamp", "quantity", "quote_qty", "is_buyer_maker")
 
 
-def validate_schema(schema: pl.Schema) -> None:
-    for column_name, expected_type in EXPECTED_SCHEMA.items():
-        actual_type = schema.get(column_name)
-        if actual_type is None:
-            raise ValueError(f"missing required column: {column_name}")
-        if actual_type != expected_type:
-            raise ValueError(
-                f"column {column_name} has type {actual_type}, expected {expected_type}"
-            )
+def collect_streaming(frame: "pl.LazyFrame") -> "pl.DataFrame":
+    """Collect with the streaming engine across Polars API versions."""
+    try:
+        return frame.collect(engine="streaming")
+    except TypeError:
+        return frame.collect(streaming=True)
 
 
-def sum_diff_plan(data: pl.LazyFrame, name: str) -> pl.LazyFrame:
-    return (
-        data.filter((pl.col("buy_den") != 0.0) & (pl.col("sell_den") != 0.0))
-        .select(
-            (
-                (pl.col("buy_num") / pl.col("buy_den"))
-                - (pl.col("sell_num") / pl.col("sell_den"))
-            )
-            .abs()
-            .sum()
-            .alias(name)
-        )
+def validate_columns(frame: "pl.LazyFrame") -> None:
+    schema = frame.collect_schema()
+    missing = [name for name in REQUIRED_COLUMNS if name not in schema]
+    if missing:
+        raise ValueError(f"missing required column(s): {', '.join(missing)}")
+
+
+def aggregate_by_second(path: str) -> "pl.DataFrame":
+    data = pl.scan_parquet(path)
+    validate_columns(data)
+
+    prepared = data.select(REQUIRED_COLUMNS).with_columns(
+        second=pl.col("timestamp").cast(pl.Int64) // NS_PER_SECOND,
     )
 
-
-def build_plans(data: pl.LazyFrame) -> tuple[pl.LazyFrame, pl.LazyFrame]:
     second_agg = (
-        data.select(REQUIRED_COLUMNS)
-        .filter(pl.col("quantity") != 0.0)
-        .with_columns(
-            timestamp_ns=pl.col("timestamp").cast(pl.Int64),
-            amount=pl.col("price") * pl.col("quantity"),
-        )
-        .with_columns(
-            second=pl.col("timestamp_ns") // NS_PER_SECOND,
-            minute=pl.col("timestamp_ns") // NS_PER_MINUTE,
-        )
-        .group_by("second", "minute")
+        prepared.group_by("second")
         .agg(
             buy_num=pl.when(~pl.col("is_buyer_maker"))
-            .then(pl.col("amount"))
+            .then(pl.col("quote_qty"))
             .otherwise(0.0)
             .sum(),
             buy_den=pl.when(~pl.col("is_buyer_maker"))
@@ -72,7 +51,7 @@ def build_plans(data: pl.LazyFrame) -> tuple[pl.LazyFrame, pl.LazyFrame]:
             .otherwise(0.0)
             .sum(),
             sell_num=pl.when(pl.col("is_buyer_maker"))
-            .then(pl.col("amount"))
+            .then(pl.col("quote_qty"))
             .otherwise(0.0)
             .sum(),
             sell_den=pl.when(pl.col("is_buyer_maker"))
@@ -80,7 +59,51 @@ def build_plans(data: pl.LazyFrame) -> tuple[pl.LazyFrame, pl.LazyFrame]:
             .otherwise(0.0)
             .sum(),
         )
+        .with_columns(minute=pl.col("second") // 60)
+        .sort("second")
     )
+
+    return collect_streaming(second_agg)
+
+
+def with_vwaps(frame: "pl.DataFrame") -> "pl.DataFrame":
+    return frame.with_columns(
+        buy_vwap=(
+            pl.when(pl.col("buy_den") > 0.0)
+            .then(pl.col("buy_num") / pl.col("buy_den"))
+            .otherwise(None)
+        ),
+        sell_vwap=(
+            pl.when(pl.col("sell_den") > 0.0)
+            .then(pl.col("sell_num") / pl.col("sell_den"))
+            .otherwise(None)
+        ),
+    ).with_columns(
+        buy_vwap=pl.col("buy_vwap").fill_null(strategy="forward"),
+        sell_vwap=pl.col("sell_vwap").fill_null(strategy="forward"),
+    )
+
+
+def compensated_sum(values: Iterable[float | None]) -> float:
+    return math.fsum(float(value) for value in values if value is not None)
+
+
+def diff_sum(frame: "pl.DataFrame") -> float:
+    if frame.is_empty():
+        return 0.0
+
+    diffs = with_vwaps(frame).select(
+        (pl.col("buy_vwap") - pl.col("sell_vwap")).abs().alias("diff")
+    )["diff"]
+    return compensated_sum(diffs)
+
+
+def calculate(path: str) -> tuple[float, float]:
+    if pl is None:
+        raise RuntimeError("Polars is not installed")
+
+    second_agg = aggregate_by_second(path)
+    vwap_s = diff_sum(second_agg)
 
     minute_agg = (
         second_agg.group_by("minute")
@@ -90,45 +113,27 @@ def build_plans(data: pl.LazyFrame) -> tuple[pl.LazyFrame, pl.LazyFrame]:
             sell_num=pl.col("sell_num").sum(),
             sell_den=pl.col("sell_den").sum(),
         )
+        .sort("minute")
     )
+    vwap_m = diff_sum(minute_agg)
 
-    return sum_diff_plan(second_agg, "VWAP_s"), sum_diff_plan(minute_agg, "VWAP_m")
-
-
-def frame_value(frame: pl.DataFrame) -> float:
-    value = frame.item()
-    return 0.0 if value is None else float(value)
-
-
-def calculate(path: str) -> tuple[float, float]:
-    if pl is None:
-        raise RuntimeError("required dependency is not installed: polars")
-
-    data = pl.scan_parquet(path)
-    validate_schema(data.collect_schema())
-
-    second_plan, minute_plan = build_plans(data)
-    second_result, minute_result = pl.collect_all(
-        [second_plan, minute_plan],
-        engine="streaming",
-    )
-    return frame_value(second_result), frame_value(minute_result)
+    return vwap_s, vwap_m
 
 
 def main() -> int:
     if len(sys.argv) != 2:
-        print(f"usage: {os.path.basename(sys.argv[0])} <path_to_parquet>", file=sys.stderr)
-        return 1
+        print(f"usage: {os.path.basename(sys.argv[0])} <input.parquet>", file=sys.stderr)
+        return 2
 
     path = sys.argv[1]
-    if not os.path.isfile(path) or not os.access(path, os.R_OK):
-        print(f"error: parquet file is not readable: {path}", file=sys.stderr)
-        return 1
+    if not os.path.isfile(path):
+        print(f"error: file does not exist: {path}", file=sys.stderr)
+        return 2
 
     try:
         vwap_s, vwap_m = calculate(path)
     except Exception as exc:
-        print(f"error: failed to read or process parquet file: {exc}", file=sys.stderr)
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     print(f"VWAP_s={vwap_s:.6f}")
